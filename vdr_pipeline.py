@@ -18,35 +18,62 @@ VDR 반출 규정 준수 | Master Table 구성 파이프라인
 ══════════════════════════════════════════════════════════════════
 """
 
+import sys
+# Windows 콘솔 한글 깨짐 방지: stdout/stderr를 UTF-8로 강제 설정
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')           # 화면 출력 없이 파일 저장
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from pathlib import Path
+import logging
 import warnings
 import gc
 
 warnings.filterwarnings('ignore')
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 
-# ── 한글 폰트 (Colab/VDR 환경) ────────────────────────────────
+# Jupyter 환경 감지: inline 백엔드가 이미 설정된 경우 Agg 강제 설정 생략
 try:
-    plt.rcParams['font.family'] = 'NanumGothic'
-except Exception:
+    import IPython
+    _in_jupyter = IPython.get_ipython() is not None
+except ImportError:
+    _in_jupyter = False
+
+if not _in_jupyter:
+    matplotlib.use('Agg')           # 화면 출력 없이 파일 저장
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.font_manager as fm
+from pathlib import Path
+
+# ── 한글 폰트 자동 탐지 (VDR/Jupyter/로컬 환경 공통) ─────────
+_KOREAN_FONTS = ['NanumGothic', 'NanumBarunGothic', 'Malgun Gothic',
+                 'Apple SD Gothic Neo', 'AppleGothic', 'Gulim', 'Dotum']
+_available = {f.name for f in fm.fontManager.ttflist}
+_korean_font = next((f for f in _KOREAN_FONTS if f in _available), None)
+
+if _korean_font:
+    plt.rcParams['font.family'] = _korean_font
+else:
+    # 폰트 없으면 한글 깨지지만 실행은 정상 진행
     pass
 plt.rcParams['axes.unicode_minus'] = False
 
 # ══════════════════════════════════════════════════════════════
-# 경로 설정
+# 경로 설정  ★ 데이터 센터 사용 시 USE_VDR = True 로 변경
 # ══════════════════════════════════════════════════════════════
-#실제 데이터 센터에서 사용할 경로
-# DRIVE = Path('/content/drive/MyDrive/Data_Analysis_Competition')
-# RDATA = Path('/Rdata1/r1_user138/dataset')
+USE_VDR = False   # False: 로컬 테스트 | True: VDR 데이터 센터
 
-#테스트용 데이터 경로
-DRIVE = Path('C:/Users/yooyj/OneDrive/문서/Code/Data/sample_data')
-RDATA = Path('C:/Users/yooyj/OneDrive/문서/Code/Data/sample_data')
+if USE_VDR:
+    DRIVE = Path('/content/drive/MyDrive/Data_Analysis_Competition')
+    RDATA = Path('/Rdata1/r1_user138/dataset')
+else:
+    DRIVE = Path('C:/Users/yooyj/OneDrive/문서/Code/Data/sample_data')
+    RDATA = Path('C:/Users/yooyj/OneDrive/문서/Code/Data/sample_data')
 
 # 가구마스터 (Google Drive)
 HFWS_2024 = DRIVE / '가계금융복지조사/2024_가구마스터_20260512_38026.csv'
@@ -160,6 +187,7 @@ def load_hfws() -> pd.DataFrame:
             names=HFWS_COLS,
             na_values=NA_VALS,
             skiprows=1,
+            encoding='cp949', 
             low_memory=False,
         )
         df['조사연도'] = yr
@@ -299,17 +327,29 @@ HSG_DTYPE = {
 }
 
 
+def _open_txt(path: Path, sep: str, dtype: dict, chunk_size: int):
+    """인코딩 자동 감지: UTF-8 실패 시 CP949로 재시도."""
+    for enc in ('utf-8', 'cp949'):
+        try:
+            return pd.read_csv(
+                path, sep=sep, dtype=dtype, chunksize=chunk_size,
+                encoding=enc, on_bad_lines='skip', low_memory=False,
+            )
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"인코딩 감지 실패: {path}")
+
+
 def read_txt_chunked(path: Path, dtype: dict, sep: str = SEP,
                      chunk_size: int = CHUNK) -> pd.DataFrame:
     """
-    대용량 txt 파일을 청크 단위로 읽어 집계.
-    메모리에 전체 로드하지 않음.
+    대용량 txt 파일을 청크 단위로 읽어 반환.
+    전체 행이 필요한 경우에만 사용 (SGIS HHD 등).
+    청크를 분할 적재한 뒤 concat — 파일이 수천만 행이면
+    aggregate_sgis 내부에서 직접 필터 후 집계 권장.
     """
     chunks = []
-    reader = pd.read_csv(
-        path, sep=sep, dtype=dtype, chunksize=chunk_size,
-        encoding='utf-8', on_bad_lines='skip', low_memory=False,
-    )
+    reader = _open_txt(path, sep, dtype, chunk_size)
     for i, chunk in enumerate(reader):
         chunk = clean_inf_nan(chunk)
         chunks.append(chunk)
@@ -349,10 +389,7 @@ def aggregate_sgis():
     # 주택통계등록부 청크 처리 후 즉시 집계
     print("  주택통계등록부 처리 중...")
     hsg_chunks = []
-    reader = pd.read_csv(
-        HSG_2023, sep=SEP, dtype=HSG_DTYPE, chunksize=CHUNK,
-        encoding='utf-8', on_bad_lines='skip', low_memory=False,
-    )
+    reader = _open_txt(HSG_2023, SEP, HSG_DTYPE, CHUNK)
     for chunk in reader:
         chunk['ARCH_APRV_YR'] = pd.to_numeric(
             chunk.get('ARCH_APRV_YR', pd.Series()), errors='coerce'
@@ -416,8 +453,7 @@ def iter_monthly_files(directory: Path, prefix: str,
     예: CARD_DOMESTIC_SEOUL_202401.txt ~ 202412.txt
     """
     for m in months:
-        # 파일명에서 01 부분을 월로 치환
-        fname = prefix.replace('01', f'{m:02d}') + suffix
+        fname = f"{prefix}{m:02d}{suffix}"
         p = directory / fname
         if p.exists():
             yield m, p
@@ -460,11 +496,7 @@ def aggregate_card_seoul():
     for month, fpath in iter_monthly_files(CARD_SEOUL_DIR, prefix, suffix='.txt'):
         print(f"  처리: {fpath.name}")
         m_chunks = []
-        for chunk in pd.read_csv(
-            fpath, sep=SEP, dtype=CARD_SEOUL_DTYPE,
-            chunksize=CHUNK, encoding='utf-8',
-            on_bad_lines='skip', low_memory=False,
-        ):
+        for chunk in _open_txt(fpath, SEP, CARD_SEOUL_DTYPE, CHUNK):
             # 65세 이상(연령코드 14·15) + 개인(1) + 노인가구(5) 필터
             mask = (
                 chunk['통합카드5세단위연령코드'].isin(['14', '15']) &
@@ -557,11 +589,7 @@ def aggregate_nice_loan():
     for month, fpath in iter_monthly_files(NICE_LOAN_DIR, prefix, suffix='.txt'):
         print(f"  처리: {fpath.name}")
         m_chunks = []
-        for chunk in pd.read_csv(
-            fpath, sep=SEP, dtype=NICE_LOAN_DTYPE,
-            chunksize=CHUNK, encoding='utf-8',
-            on_bad_lines='skip', low_memory=False,
-        ):
+        for chunk in _open_txt(fpath, SEP, NICE_LOAN_DTYPE, CHUNK):
             mask = (
                 chunk['연령구간대'].isin(['65', '70']) &
                 (chunk['직업구분'] == '0') &
@@ -668,11 +696,7 @@ def aggregate_nice_income():
     for month, fpath in iter_monthly_files(NICE_INCOM_DIR, prefix, suffix='.txt'):
         print(f"  처리: {fpath.name}")
         m_chunks = []
-        for chunk in pd.read_csv(
-            fpath, sep=SEP, dtype=NICE_INCOM_DTYPE,
-            chunksize=CHUNK, encoding='utf-8',
-            on_bad_lines='skip', low_memory=False,
-        ):
+        for chunk in _open_txt(fpath, SEP, NICE_INCOM_DTYPE, CHUNK):
             mask = (
                 chunk['연령구간대'].isin(['65', '70']) &
                 (chunk['직업 구분'] == '0') &       # 공백 포함 항목명
@@ -753,11 +777,7 @@ def aggregate_card_apt():
     for month, fpath in iter_monthly_files(CARD_APT_DIR, prefix, suffix='.txt'):
         print(f"  처리: {fpath.name}")
         m_chunks = []
-        for chunk in pd.read_csv(
-            fpath, sep=SEP, dtype=CARD_APT_DTYPE,
-            chunksize=CHUNK, encoding='utf-8',
-            on_bad_lines='skip', low_memory=False,
-        ):
+        for chunk in _open_txt(fpath, SEP, CARD_APT_DTYPE, CHUNK):
             # 60대 이상(6) 필터
             sub = chunk[chunk['통합카드10세단위연령코드'] == '6'].copy()
             if sub.empty:
@@ -827,11 +847,7 @@ def aggregate_nh_apt():
     for month, fpath in iter_monthly_files(NH_APT_DIR, prefix, suffix='.txt'):
         print(f"  처리: {fpath.name}")
         m_chunks = []
-        for chunk in pd.read_csv(
-            fpath, sep=SEP, dtype=CARD_APT_DTYPE,
-            chunksize=CHUNK, encoding='utf-8',
-            on_bad_lines='skip', low_memory=False,
-        ):
+        for chunk in _open_txt(fpath, SEP, CARD_APT_DTYPE, CHUNK):
             sub = chunk[chunk['통합카드10세단위연령코드'] == '6'].copy()
             if sub.empty:
                 continue
@@ -889,10 +905,7 @@ def aggregate_pos_sgg():
         return
 
     chunks = []
-    for chunk in pd.read_csv(
-        fpath, sep=SEP, chunksize=CHUNK,
-        encoding='utf-8', on_bad_lines='skip', low_memory=False,
-    ):
+    for chunk in _open_txt(fpath, SEP, {}, CHUNK):
         chunk = clean_inf_nan(chunk)
         chunks.append(chunk)
 
