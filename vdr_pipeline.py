@@ -14,6 +14,7 @@ VDR 반출 규정 준수 | Master Table 구성 파이프라인
   - txt 데이터: 청크(chunk) 단위 처리 후 즉시 집계
   - dtype 사전 지정으로 메모리 최대 40% 절감
   - 가구마스터: 최적화 없이 전체 로드 (규정 준수)
+  - 분석 범위: 수도권 (서울 11 + 인천 28 + 경기 41)
   - 월별 12개 파일: 루프 처리 후 집계 결과만 메모리 보유
 ══════════════════════════════════════════════════════════════════
 """
@@ -100,6 +101,8 @@ OUT_IMG.mkdir(parents=True, exist_ok=True)
 
 # 구분자
 SEP = '|'
+# 분석 범위: 수도권 (서울 11 + 인천 28 + 경기 41)
+METRO_SIDO = ['11', '28', '41']
 # 청크 크기 (메모리 조절)
 CHUNK = 200_000
 
@@ -177,6 +180,7 @@ def load_hfws() -> pd.DataFrame:
     """
     2023·2024 가구마스터 병합.
     규정: 최적화 없이 전체 로드 (요청 사항).
+    # 수도권여부 'G1' = 서울+인천+경기 → METRO_SIDO와 정확히 일치하므로 별도 필터 불필요
     """
     print("\n[STEP 1] 가계금융복지조사 로드")
 
@@ -252,7 +256,7 @@ def aggregate_hfws(panel: pd.DataFrame):
     [규정 2] K-Anonymity: 표본수 < 5 행 제거
     [규정 3] .xlsx 저장
     """
-    print("\n[STEP 1-A] 가계금융복지조사 집계")
+    print("\n[STEP 1-A] 가계금융복지조사 집계 (수도권)")
 
     # ── 집계 1: 유형 × 연령그룹 × 조사연도
     grp1 = panel.groupby(['조사연도','연령그룹','고령층유형']).agg(
@@ -368,7 +372,7 @@ def aggregate_sgis():
     [규정 2] K-Anonymity 적용
     [규정 3] .xlsx 저장
     """
-    print("\n[STEP 2] SGIS 등록부 처리")
+    print("\n[STEP 2] SGIS 등록부 처리 (수도권)")
 
     # 가구통계등록부 로드
     print("  가구통계등록부 로드 중...")
@@ -376,6 +380,8 @@ def aggregate_sgis():
     hhd['AAGE'] = pd.to_numeric(hhd.get('AAGE', pd.Series()), errors='coerce')
     hhd['MBHS_CNT'] = pd.to_numeric(hhd.get('MBHS_CNT', pd.Series()), errors='coerce')
     hhd['시군구코드'] = hhd['ADMDST_CLSF_CD'].astype(str).str[:5]
+    # 수도권 필터 (서울 11 + 인천 28 + 경기 41)
+    hhd = hhd[hhd['ADMDST_CLSF_CD'].astype(str).str[:2].isin(METRO_SIDO)].copy()
 
     # 65세 이상 필터 — 메모리 즉시 절감
     hhd_elderly = hhd[hhd['AAGE'] >= 65].copy()
@@ -397,6 +403,10 @@ def aggregate_sgis():
         chunk['RSDT_AREA'] = pd.to_numeric(
             chunk.get('RSDT_AREA', pd.Series()), errors='coerce'
         )
+        # 청크 내 수도권 필터
+        chunk = chunk[chunk['ADMDST_CLSF_CD'].astype(str).str[:2].isin(METRO_SIDO)].copy()
+        if chunk.empty:
+            continue
         chunk['건물연령'] = 2023 - chunk['ARCH_APRV_YR'].fillna(2023)
         chunk['노후건물'] = (chunk['건물연령'] >= 30).astype(int)
         # 청크 내 LVQT_SN 단위 집계 후 버퍼
@@ -483,7 +493,7 @@ CARD_SEOUL_DTYPE = {
 
 def aggregate_card_seoul():
     """
-    내국인 국내카드소비(서울) — 65세 이상 × 시군구 × 업종 집계.
+    내국인 국내카드소비(서울 가맹점) — 수도권 거주 65세 이상 × 시군구 × 업종 집계.
     [규정 1] 집계 결과만 반출
     [규정 2] 건수 < 5 제거
     [규정 3] .xlsx 저장
@@ -497,11 +507,12 @@ def aggregate_card_seoul():
         print(f"  처리: {fpath.name}")
         m_chunks = []
         for chunk in _open_txt(fpath, SEP, CARD_SEOUL_DTYPE, CHUNK):
-            # 65세 이상(연령코드 14·15) + 개인(1) + 노인가구(5) 필터
+            # 65세 이상(연령코드 14·15) + 개인(1) + 노인가구(5) + 수도권 거주 필터
             mask = (
                 chunk['통합카드5세단위연령코드'].isin(['14', '15']) &
                 (chunk['조직구분코드'] == '1') &
-                (chunk['통합카드가구형태코드'] == '5')
+                (chunk['통합카드가구형태코드'] == '5') &
+                chunk['고객행정구역분류시도코드'].isin(METRO_SIDO)  # 수도권 거주자
             )
             sub = chunk[mask].copy()
             if sub.empty:
@@ -581,7 +592,7 @@ def aggregate_nice_loan():
     연령구간대: 65(65~70세미만), 70(70세 이상) 필터
     직업구분: 0(전체) 만 사용
     """
-    print("\n[STEP 5] NICE 대출·연체 월별 처리")
+    print("\n[STEP 5] NICE 대출·연체 월별 처리 (수도권)")
 
     monthly = []
     prefix = 'NICE_LOAN_AGE_2024'
@@ -593,7 +604,8 @@ def aggregate_nice_loan():
             mask = (
                 chunk['연령구간대'].isin(['65', '70']) &
                 (chunk['직업구분'] == '0') &
-                (chunk['구분명'] == 'CNTY_GU')   # 시군구 단위만
+                (chunk['구분명'] == 'CNTY_GU') &   # 시군구 단위만
+                chunk['광역시도코드'].isin(METRO_SIDO)  # 수도권
             )
             sub = chunk[mask].copy()
             if sub.empty:
@@ -688,7 +700,7 @@ def aggregate_nice_income():
     NICE 소득 월별 집계.
     '직업 구분'(공백 포함) '평균 연소득 금액'(공백 포함) 항목명 준수.
     """
-    print("\n[STEP 6] NICE 소득 월별 처리")
+    print("\n[STEP 6] NICE 소득 월별 처리 (수도권)")
 
     monthly = []
     prefix = 'NICE_INCOM_AGE_2024'
@@ -699,8 +711,9 @@ def aggregate_nice_income():
         for chunk in _open_txt(fpath, SEP, NICE_INCOM_DTYPE, CHUNK):
             mask = (
                 chunk['연령구간대'].isin(['65', '70']) &
-                (chunk['직업 구분'] == '0') &       # 공백 포함 항목명
-                (chunk['구분명'] == 'CNTY_GU')
+                (chunk['직업 구분'] == '0') &       # 공백 포함 항목명 유지
+                (chunk['구분명'] == 'CNTY_GU') &
+                chunk['광역시도코드'].isin(METRO_SIDO)  # 수도권
             )
             sub = chunk[mask].copy()
             if sub.empty:
@@ -769,7 +782,7 @@ def aggregate_card_apt():
     아파트단지별소비(통합카드) — 60대 이상 + 시군구 집계.
     행정동·단지 단위 수치 반출 금지 → 시군구 집계 후 저장.
     """
-    print("\n[STEP 7] 아파트단지별소비(통합카드) 처리")
+    print("\n[STEP 7] 아파트단지별소비(통합카드) 처리 (수도권)")
 
     monthly = []
     prefix = 'CARD_APARTMENT_2024'
@@ -778,8 +791,11 @@ def aggregate_card_apt():
         print(f"  처리: {fpath.name}")
         m_chunks = []
         for chunk in _open_txt(fpath, SEP, CARD_APT_DTYPE, CHUNK):
-            # 60대 이상(6) 필터
-            sub = chunk[chunk['통합카드10세단위연령코드'] == '6'].copy()
+            # 60대 이상(6) + 수도권 거주자 필터
+            sub = chunk[
+                (chunk['통합카드10세단위연령코드'] == '6') &
+                chunk['고객행정구역분류시도코드'].isin(METRO_SIDO)  # 수도권 거주자
+            ].copy()
             if sub.empty:
                 continue
 
@@ -839,7 +855,7 @@ def aggregate_card_apt():
 
 def aggregate_nh_apt():
     """농협카드 아파트단지별소비 — CARD_APT와 동일 로직."""
-    print("\n[STEP 8] 농협카드 아파트단지별소비 처리")
+    print("\n[STEP 8] 농협카드 아파트단지별소비 처리 (수도권)")
 
     monthly = []
     prefix = 'NHCRD_APARTMENT_2024'
@@ -848,7 +864,10 @@ def aggregate_nh_apt():
         print(f"  처리: {fpath.name}")
         m_chunks = []
         for chunk in _open_txt(fpath, SEP, CARD_APT_DTYPE, CHUNK):
-            sub = chunk[chunk['통합카드10세단위연령코드'] == '6'].copy()
+            sub = chunk[
+                (chunk['통합카드10세단위연령코드'] == '6') &
+                chunk['고객행정구역분류시도코드'].isin(METRO_SIDO)  # 수도권 거주자
+            ].copy()
             if sub.empty:
                 continue
             if '연평균소득금액' in sub.columns:
@@ -897,7 +916,7 @@ def aggregate_nh_apt():
 
 def aggregate_pos_sgg():
     """외식업물가 시군구 — 단일 파일, 청크 처리."""
-    print("\n[STEP 9] 외식업물가 처리")
+    print("\n[STEP 9] 외식업물가 처리 (수도권)")
 
     fpath = NICE_POS_DIR / 'TN_PD_NICE_POG_SGG_202501.txt'
     if not fpath.exists():
@@ -907,6 +926,10 @@ def aggregate_pos_sgg():
     chunks = []
     for chunk in _open_txt(fpath, SEP, {}, CHUNK):
         chunk = clean_inf_nan(chunk)
+        # 수도권 필터 (시군구코드 앞 2자리)
+        sido_col = next((c for c in chunk.columns if '시군구코드' in c or '시도코드' in c), None)
+        if sido_col:
+            chunk = chunk[chunk[sido_col].astype(str).str[:2].isin(METRO_SIDO)].copy()
         chunks.append(chunk)
 
     if not chunks:
@@ -955,7 +978,7 @@ def create_visualizations(grp1: pd.DataFrame):
         values='추정가구수_가중치', aggfunc='sum', fill_value=0
     )
     pivot.plot(kind='bar', ax=ax, width=0.7)
-    ax.set_title('고령층 유형별 전국 추정 가구 분포 (2024)', fontsize=13)
+    ax.set_title('고령층 유형별 수도권 추정 가구 분포 (2024)', fontsize=13)
     ax.set_xlabel('연령 그룹')
     ax.set_ylabel('추정 가구 수')
     ax.legend(loc='upper right', fontsize=9)
@@ -1000,7 +1023,7 @@ def create_visualizations(grp1: pd.DataFrame):
                 'o-', color='#E8593C', lw=2.5, ms=8)
         ax.fill_between(trend['조사연도'], trend['추정가구수_가중치'],
                         alpha=0.15, color='#E8593C')
-        ax.set_title('B유형(자산-소득 불일치) 추정 가구 추이', fontsize=12)
+        ax.set_title('B유형(자산-소득 불일치) 수도권 추이', fontsize=12)
         ax.set_xlabel('조사연도')
         ax.set_ylabel('추정 가구 수')
         ax.set_yticklabels([])  # 수치 미표기 (규정 3)
