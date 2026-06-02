@@ -343,9 +343,27 @@ def filter_elderly_hfws(df: pd.DataFrame) -> pd.DataFrame:
 # LAYER 4. 파생변수 생성
 # ════════════════════════════════════════════════════════════════
 
-# 2026 기준 중위소득 (월, 원) — 보건복지부 고시
-MEDIAN_INCOME_2026 = {1:2_564_238, 2:4_195_502, 3:5_357_117,
-                       4:6_494_738, 5:7_576_722, 6:8_604_732}
+# 연도별 정부 고시 기준 중위소득 100% (월, 원) — 보건복지부 고시
+MEDIAN_INCOME_BY_YEAR = {
+    2023: {1: 2_077_892, 2: 3_456_155, 3: 4_434_816,
+           4: 5_400_964, 5: 6_330_688, 6: 7_227_981, 7: 8_107_515},
+    2024: {1: 2_228_445, 2: 3_682_609, 3: 4_714_657,
+           4: 5_729_913, 5: 6_695_735, 6: 7_618_369, 7: 8_514_994},
+}
+# 7인 초과 시 1인 추가당 가산액
+MEDIAN_INCOME_ADD = {2023: 879_534, 2024: 896_625}
+
+
+def get_dynamic_poverty_line(year: int, num_members: int) -> float:
+    """연도·가구원수별 정부 고시 빈곤선(중위소득 50%, 연간 만원)."""
+    year = int(year)
+    num  = int(num_members) if not pd.isna(num_members) else 1
+    if year not in MEDIAN_INCOME_BY_YEAR:
+        year = max(MEDIAN_INCOME_BY_YEAR.keys())
+    tbl = MEDIAN_INCOME_BY_YEAR[year]
+    add = MEDIAN_INCOME_ADD[year]
+    monthly = tbl[num] if num <= 7 else tbl[7] + (num - 7) * add
+    return round((monthly * 0.5 * 12) / 10_000, 1)
 
 INC_COL = "처분가능소득(보완)[경상소득(보완)-비소비지출(보완)]"
 RE_COL  = "자산_실물자산_부동산_거주주택금액"
@@ -418,9 +436,10 @@ def classify_persona(df: pd.DataFrame) -> pd.DataFrame:
           보고서에 반드시 명시 필요
     """
     df["정부기준빈곤선"] = df.apply(
-        lambda r: (MEDIAN_INCOME_2026.get(
-            min(int(r["가구원수"]) if pd.notna(r["가구원수"]) else 1, 6
-        ), 8_604_732) * 0.5 * 12) / 10_000,
+        lambda r: get_dynamic_poverty_line(
+            r.get("조사연도", max(MEDIAN_INCOME_BY_YEAR.keys())),
+            r["가구원수"]
+        ),
         axis=1
     )
     df["자산분위_내부"] = pd.qcut(
@@ -435,7 +454,7 @@ def classify_persona(df: pd.DataFrame) -> pd.DataFrame:
         저소득 = r["소득분위_내부"] <= 2
         고자산 = r["자산분위_내부"] >= 4
         if 빈곤 and 저소득 and 고자산:
-            return "B유형_자산소득불일치(사각지대)"
+            return "B유형_자산소득불일치"
         elif 빈곤 and r["자산분위_내부"] <= 2:
             return "A유형_구조적취약층"
         elif not 저소득 and 고자산:
@@ -714,7 +733,7 @@ def build_master_table(hfws: pd.DataFrame, sgis=None,
     print(f"{'='*60}")
     print(dist)
 
-    b_total = int(master[master["고령층유형"]=="B유형_자산소득불일치(사각지대)"]["가중값"].sum())
+    b_total = int(master[master["고령층유형"]=="B유형_자산소득불일치"]["가중값"].sum())
     print(f"\n📢 B유형(사각지대) 전국 추정: 약 {b_total:,}가구")
     print("   → 주택연금 최우선 정책 타겟")
 

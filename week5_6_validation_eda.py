@@ -20,6 +20,11 @@ OUTPUT_DIR = Path("./output")
 FIG_DIR = OUTPUT_DIR / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
+# vdr_pipeline.py 실제 컬럼명 (week1 단순명과 다름 — 혼용 방지용 상수)
+INC_COL = '처분가능소득(보완)[경상소득(보완)-비소비지출(보완)]'
+RE_COL  = '자산_실물자산_부동산_거주주택금액'
+AGE_COL = '가구주_만연령'   # week1의 '가구주_연령' → 실제 컬럼명
+
 # 한글 폰트 설정 (SDC 환경에 맞게 조정)
 plt.rcParams["font.family"] = "Malgun Gothic"
 plt.rcParams["axes.unicode_minus"] = False
@@ -50,17 +55,21 @@ def check_sampling_bias(df: pd.DataFrame):
         for k, v in dist.items():
             print(f"   {k}: {v:.1%}")
 
-    # 소득 분위 분포 (균등해야 25%씩)
-    if "소득_분위" in latest.columns:
+    # 소득 분위 분포 (균등해야 20%씩)
+    # vdr_pipeline: '소득분위_내부' / week1: '소득_분위' — 둘 다 지원
+    inc_q = "소득분위_내부" if "소득분위_내부" in latest.columns else "소득_분위"
+    if inc_q in latest.columns:
         print("\n② 소득 분위 분포 (이상: 각 20%):")
-        dist = latest["소득_분위"].value_counts(normalize=True).sort_index()
+        dist = latest[inc_q].value_counts(normalize=True).sort_index()
         for k, v in dist.items():
             flag = "✓" if abs(v - 0.20) < 0.05 else "⚠"
-            print(f"   {flag} {k}: {v:.1%}")
+            print(f"   {flag} {k}분위: {v:.1%}")
 
     # 부동산 보유율 (보고서 기준: 73~74%)
-    if "부동산자산" in latest.columns:
-        re_rate = (latest["부동산자산"] > 0).mean()
+    # vdr_pipeline: RE_COL / week1: '부동산자산' — 둘 다 지원
+    re_col = RE_COL if RE_COL in latest.columns else "부동산자산"
+    if re_col in latest.columns:
+        re_rate = (latest[re_col] > 0).mean()
         flag = "✓" if 0.68 <= re_rate <= 0.80 else "⚠ 괴리 확인 필요"
         print(f"\n③ 부동산 보유율: {re_rate:.1%} ({flag})")
 
@@ -103,9 +112,11 @@ def plot_asset_income_gap(df: pd.DataFrame):
       순자산/전체평균 배율 2012→2024 (1.038배 돌파)
       소득/전체평균 배율 2012→2024 (0.609배)
     """
+    # vdr_pipeline: INC_COL / week1: '총소득' — 둘 다 지원
+    inc = INC_COL if INC_COL in df.columns else "총소득"
     yearly = df.groupby("조사연도").agg(
         고령순자산평균=("순자산", "mean"),
-        고령소득평균=("총소득", "mean"),
+        고령소득평균=(inc, "mean"),
     ).reset_index()
 
     # 전체 평균 대비 배율 (실제 전체 평균이 없으면 초기값 대비)
@@ -144,7 +155,11 @@ def plot_d_value_distribution(df: pd.DataFrame):
         return
 
     latest = df[df["조사연도"] == df["조사연도"].max()]
-    low_income = latest[latest["소득_분위"] == "1분위(하위20%)"]
+    # vdr_pipeline: '소득분위_내부'(int 1~5) / week1: '소득_분위'(str) — 둘 다 지원
+    inc_q = "소득분위_내부" if "소득분위_내부" in latest.columns else "소득_분위"
+    low_income = latest[
+        latest[inc_q] == (1 if inc_q == "소득분위_내부" else "1분위(하위20%)")
+    ]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
@@ -187,8 +202,10 @@ def plot_lti_heatmap_by_age(df: pd.DataFrame):
 
     # 5세 구간 연령대
     latest = latest.copy()
+    # vdr_pipeline: AGE_COL='가구주_만연령' / week1: '가구주_연령' — 둘 다 지원
+    age_col = AGE_COL if AGE_COL in latest.columns else "가구주_연령"
     latest["연령대"] = pd.cut(
-        latest["가구주_연령"],
+        latest[age_col],
         bins=[64, 69, 74, 79, 84, 150],
         labels=["65-69", "70-74", "75-79", "80-84", "85+"]
     )
