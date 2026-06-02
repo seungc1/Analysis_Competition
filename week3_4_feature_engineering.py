@@ -18,8 +18,9 @@ from typing import Optional
 
 OUTPUT_DIR = Path("./output")
 
-# mlxtend 사용 (pip install mlxtend)
-# SDC 환경에서 설치 안 될 경우 직접 FP-Growth 구현도 포함
+# vdr_pipeline.py 컬럼명 상수 (두 파일 간 호환)
+RE_COL  = '자산_실물자산_부동산_거주주택금액'
+INC_COL = '처분가능소득(보완)[경상소득(보완)-비소비지출(보완)]'
 
 
 # ════════════════════════════════════════════════════════════════
@@ -154,7 +155,7 @@ def create_asset_age_index(df: pd.DataFrame, grid_stats: Optional[pd.DataFrame] 
 def discretize_for_apriori(df: pd.DataFrame) -> pd.DataFrame:
     """
     연속변수를 이진(True/False) 항목으로 변환 → 연관규칙 분석 입력 형태.
-    
+
     항목 정의:
       고가주택   : 부동산자산 상위 40%
       소득빈곤   : 총소득 하위 30%
@@ -163,56 +164,126 @@ def discretize_for_apriori(df: pd.DataFrame) -> pd.DataFrame:
       후기고령   : 75세 이상
       부동산집중 : 부동산편중도 >= 0.80
     """
-    q60_re = df["부동산자산"].quantile(0.60)
-    q30_in = df["총소득"].quantile(0.30)
-    q25_med = df.get("의료비지출", pd.Series(0, index=df.index)).quantile(0.25)
+    # vdr_pipeline.py 컬럼명 호환: 두 네이밍 모두 지원
+    re_col  = RE_COL  if RE_COL  in df.columns else '부동산자산'
+    inc_col = INC_COL if INC_COL in df.columns else '총소득'
+    med_col = '지출_소비지출_의료비' if '지출_소비지출_의료비' in df.columns else '의료비지출'
+    age_col = '가구주_만연령' if '가구주_만연령' in df.columns else '가구주_연령'
+
+    q60_re   = df[re_col].quantile(0.60)
+    q30_in   = df[inc_col].quantile(0.30)
+    q25_med  = df[med_col].quantile(0.25) if med_col in df.columns else 0
 
     items = pd.DataFrame({
-        "고가주택":    df["부동산자산"] >= q60_re,
-        "소득빈곤":    df["총소득"] <= q30_in,
-        "카드연체":    df.get("연체여부", pd.Series(False, index=df.index)).fillna(False).astype(bool),
-        "저의료비":    df.get("의료비지출", pd.Series(0, index=df.index)) <= q25_med,
-        "후기고령":    df["가구주_연령"] >= 75,
-        "부동산집중":  df["부동산편중도"] >= 0.80,
-        "유동성함정":  df.get("LTI_등급", pd.Series("정상", index=df.index)) == "유동성함정",
+        "고가주택"  : df[re_col] >= q60_re,
+        "소득빈곤"  : df[inc_col] <= q30_in,
+        "카드연체"  : df.get("연체여부",   pd.Series(False, index=df.index)).fillna(False).astype(bool),
+        "저의료비"  : df[med_col] <= q25_med if med_col in df.columns
+                      else pd.Series(False, index=df.index),
+        "후기고령"  : df[age_col] >= 75,
+        "부동산집중": df.get('부동산편중도', pd.Series(0, index=df.index)).fillna(0) >= 0.80,
+        "유동성함정": df.get("LTI_등급",    pd.Series("정상", index=df.index)) == "유동성함정",
         "자산기반소비": df.get("D_Value_등급", pd.Series("정상소비", index=df.index)) == "자산기반소비",
     })
     return items
 
 
-def run_association_rules(df: pd.DataFrame, min_support: float = 0.05, min_confidence: float = 0.4):
+def run_association_rules(df: pd.DataFrame,
+                          min_support: float = 0.05,
+                          min_confidence: float = 0.4) -> pd.DataFrame:
     """
-    FP-Growth 기반 연관 규칙 분석.
-    
-    발굴 목표 규칙 (스토리 핵심):
-      {고가주택, 카드연체} → {저의료비}
-        = 자산은 많으나 유동성 없어 병원을 미루는 패턴
-      {부동산집중, 후기고령} → {소득빈곤}
-        = 연구보고서 'asset-rich, income-poor' 직접 검증
-      {소득빈곤, 고가주택} → {자산기반소비}
-        = 소득통계 빈곤이나 실제 소비는 자산 기반 → '유형 빈곤'
+    순수 Pandas 기반 연관 규칙 분석 (VDR 환경 호환 — mlxtend 불필요).
+    K-Anonymity(조건절 표본 5건 미만 시 자동 마스킹) 내장.
+
+    분석 규칙 3개:
+      Rule_1: {고가주택, B유형} → {저의료비}   (현금없어 병원 못 감)
+      Rule_2: {고가주택, B유형, 후기고령} → {저의료비} (후기 노인 의료 포기)
+      Rule_3: {고가주택, B유형} → {식비집중}   (식비만 겨우 유지)
     """
     items = discretize_for_apriori(df)
+    total_n = len(items)
 
-    try:
-        from mlxtend.frequent_patterns import fpgrowth, association_rules as ar_func
-        
-        freq_items = fpgrowth(items, min_support=min_support, use_colnames=True)
-        rules = ar_func(freq_items, metric="confidence", min_threshold=min_confidence)
-        rules = rules.sort_values("lift", ascending=False)
+    def _calc(antecedents: list, consequent: str) -> tuple:
+        """
+        지지도·신뢰도·향상도·조건절_표본수 산출.
+        조건절 또는 동시만족 표본이 5건 미만이면 NaN 반환 (K-Anonymity).
+        """
+        cond = items.copy()
+        for item in antecedents:
+            cond = cond[cond[item] == True]
+        cond_n = len(cond)
 
-        # 핵심 규칙 필터
-        print("\n📌 핵심 연관 규칙 (lift > 1.5):")
-        key_rules = rules[rules["lift"] > 1.5]
-        for _, r in key_rules.head(10).iterrows():
-            print(f"  {set(r.antecedents)} → {set(r.consequents)}")
-            print(f"    지지도: {r.support:.2%}  신뢰도: {r.confidence:.2%}  향상도: {r.lift:.2f}")
-        
-        return rules
+        both_n = len(cond[cond[consequent] == True])
 
-    except ImportError:
-        print("mlxtend 미설치 → 수동 집계 방식으로 대체")
-        return manual_association_check(items)
+        # K-Anonymity: 5건 미만 → 마스킹
+        if cond_n < 5 or both_n < 5:
+            return np.nan, np.nan, np.nan, cond_n
+
+        support    = both_n / total_n
+        confidence = both_n / cond_n
+        base_prob  = items[consequent].mean()
+        lift       = confidence / base_prob if base_prob > 0 else 0.0
+
+        return support, confidence, lift, cond_n
+
+    rules_config = [
+        {
+            'id'  : 'Rule_1',
+            'ant' : ['고가주택', 'B유형'],
+            'con' : '저의료비',
+            'desc': '{고가주택, B유형} → {저의료비}: 현금부족으로 병원 기피',
+        },
+        {
+            'id'  : 'Rule_2',
+            'ant' : ['고가주택', 'B유형', '후기고령'],
+            'con' : '저의료비',
+            'desc': '{고가주택, B유형, 후기고령} → {저의료비}: 후기 고령자 의료 포기',
+        },
+        {
+            'id'  : 'Rule_3',
+            'ant' : ['고가주택', 'B유형'],
+            'con' : '식비집중',
+            'desc': '{고가주택, B유형} → {식비집중}: 식비만 겨우 유지하는 경직 소비',
+        },
+    ]
+
+    # discretize_for_apriori 결과에 B유형·식비집중 항목 추가
+    items['B유형'] = df.get('고령층유형',
+                            pd.Series('', index=df.index)) == 'B유형_자산소득불일치'
+    items['식비집중'] = df.get(
+        '지출_소비지출_식료품(외식비포함)',
+        pd.Series(0, index=df.index)
+    ) >= df.get(
+        '지출_소비지출_식료품(외식비포함)',
+        pd.Series(0, index=df.index)
+    ).quantile(0.80)
+
+    rows = []
+    for r in rules_config:
+        sup, conf, lift, cnt = _calc(r['ant'], r['con'])
+        rows.append({
+            '규칙ID'                  : r['id'],
+            '연관규칙_구조'           : r['desc'],
+            '조건절_표본수'           : cnt,
+            '지지도(Support)'         : round(sup,  4) if not np.isnan(sup)  else '마스킹(5건미만)',
+            '신뢰도(Confidence)'      : round(conf, 4) if not np.isnan(conf) else '마스킹(5건미만)',
+            '향상도(Lift)'            : round(lift, 4) if not np.isnan(lift) else '마스킹(5건미만)',
+        })
+
+    result = pd.DataFrame(rows)
+
+    # min_support·min_confidence 기준 필터 (마스킹 행 제외)
+    numeric_mask = pd.to_numeric(result['지지도(Support)'], errors='coerce').notna()
+    result_filtered = result[
+        numeric_mask &
+        (pd.to_numeric(result['지지도(Support)'],    errors='coerce') >= min_support) &
+        (pd.to_numeric(result['신뢰도(Confidence)'], errors='coerce') >= min_confidence)
+    ].copy()
+
+    print(f"\n연관 규칙 분석 결과 ({len(result_filtered)}개 규칙 통과):")
+    print(result_filtered.to_string(index=False))
+
+    return result_filtered
 
 
 def manual_association_check(items: pd.DataFrame) -> pd.DataFrame:

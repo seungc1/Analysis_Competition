@@ -106,15 +106,41 @@ METRO_SIDO = ['11', '28', '41']
 # 청크 크기 (메모리 조절)
 CHUNK = 200_000
 
-# 2026 기준 중위소득 50% (월→연, 만원)
-POVERTY_LINE_2026 = {
-    1: round(2_564_238 * 0.5 * 12 / 10_000, 1),
-    2: round(4_195_502 * 0.5 * 12 / 10_000, 1),
-    3: round(5_357_117 * 0.5 * 12 / 10_000, 1),
-    4: round(6_494_738 * 0.5 * 12 / 10_000, 1),
-    5: round(7_576_722 * 0.5 * 12 / 10_000, 1),
-    6: round(8_604_732 * 0.5 * 12 / 10_000, 1),
+# 연도별 정부 고시 기준 중위소득 100% (월, 원)
+# 출처: 보건복지부 고시 — 각 연도 실제 적용값
+MEDIAN_INCOME_BY_YEAR = {
+    2023: {1: 2_077_892, 2: 3_456_155, 3: 4_434_816,
+           4: 5_400_964, 5: 6_330_688, 6: 7_227_981, 7: 8_107_515},
+    2024: {1: 2_228_445, 2: 3_682_609, 3: 4_714_657,
+           4: 5_729_913, 5: 6_695_735, 6: 7_618_369, 7: 8_514_994},
 }
+# 7인 초과 시 1인 추가당 가산액
+MEDIAN_INCOME_ADD = {2023: 879_534, 2024: 896_625}
+
+
+def get_dynamic_poverty_line(year: int, num_members: int) -> float:
+    """
+    연도·가구원수별 정부 고시 빈곤선(중위소득 50%) 산출.
+    - 데이터가 없는 연도는 가장 최신 연도 값으로 대체
+    - 반환값: 연간 만원 단위
+    """
+    year = int(year)
+    num = int(num_members) if not pd.isna(num_members) else 1
+
+    # 연도 데이터 없으면 최신 연도 사용
+    if year not in MEDIAN_INCOME_BY_YEAR:
+        year = max(MEDIAN_INCOME_BY_YEAR.keys())
+
+    tbl = MEDIAN_INCOME_BY_YEAR[year]
+    add = MEDIAN_INCOME_ADD[year]
+
+    if num <= 7:
+        monthly_100 = tbl[num]
+    else:
+        monthly_100 = tbl[7] + (num - 7) * add
+
+    return round((monthly_100 * 0.5 * 12) / 10_000, 1)
+
 
 INC_COL = '처분가능소득(보완)[경상소득(보완)-비소비지출(보완)]'
 RE_COL  = '자산_실물자산_부동산_거주주택금액'
@@ -208,10 +234,10 @@ def load_hfws() -> pd.DataFrame:
     panel['연령그룹'] = np.where(panel['가구주_만연령'] < 75,
                                  '전기고령자(65-74)', '후기고령자(75+)')
 
-    # 2026 정부기준빈곤선 (가구원수별 적용)
-    panel['정부기준빈곤선'] = panel['가구원수'].apply(
-        lambda n: POVERTY_LINE_2026.get(min(int(n) if pd.notna(n) else 1, 6),
-                                        POVERTY_LINE_2026[6])
+    # 연도별 동적 빈곤선 (2023·2024 각각 다른 정부 고시값 적용)
+    panel['정부기준빈곤선'] = panel.apply(
+        lambda r: get_dynamic_poverty_line(r['조사연도'], r['가구원수']),
+        axis=1
     )
 
     # 파생변수
@@ -220,6 +246,23 @@ def load_hfws() -> pd.DataFrame:
         panel['자산'] > 0, panel[RE_COL] / panel['자산'], np.nan
     )
     panel['부동산편중도'] = panel['부동산편중도'].replace([np.inf, -np.inf], np.nan)
+
+    # 경직적_비용비중: 세금+공적보험료 / 경상소득 (유승찬 코드 Block 1 채택)
+    # 의미: 소득 중 줄일 수 없는 고정 지출 비중 → 높을수록 가처분소득 압박
+    panel['경직적_비용비중'] = (
+        panel['지출_비소비지출_세금(보완)'].fillna(0) +
+        panel['지출_비소비지출_공적연금사회보험료(보완)'].fillna(0)
+    ) / (panel['경상소득(보완)'] + 1e-6)
+    panel['경직적_비용비중'] = panel['경직적_비용비중'].replace(
+        [np.inf, -np.inf], np.nan
+    ).fillna(0)
+
+    # 유동성_정체지수_raw: 거주주택금액 / (처분가능소득 + 1)
+    # 집계 4의 분산 계산용 원시 지수 (LTI와 별도 보완 지표)
+    panel['유동성_정체지수_raw'] = panel[RE_COL] / (panel[INC_COL] + 1)
+    panel['유동성_정체지수_raw'] = panel['유동성_정체지수_raw'].replace(
+        [np.inf, -np.inf], np.nan
+    ).fillna(0)
 
     # 내부 분위
     panel['자산분위_내부'] = pd.qcut(
@@ -298,6 +341,39 @@ def aggregate_hfws(panel: pd.DataFrame):
     grp3 = clean_inf_nan(grp3)
     grp3 = apply_k_anonymity(grp3, '표본수', k=5)
     save_xlsx(grp3, '03_주택종류별_집계.xlsx')
+
+    # ── 집계 4: 다각도 교차 그루핑 매트릭스 (mean + var 동시 산출)
+    # 수도권 × 주택종류 × 고령층유형 × 부채유무 교차 분석
+    # 분산(var): "같은 수도권 아파트라도 자산 격차 극심" 양극화 입증용
+    df_multi = panel.copy()
+    df_multi['부채유무'] = np.where(df_multi['부채'] > 0, '부채있음', '부채없음')
+    df_multi['수도권여부'] = df_multi['수도권여부'].fillna('미분류')
+    df_multi['주택종류통합코드'] = df_multi['주택종류통합코드'].fillna('미분류')
+    df_multi['부채유무'] = df_multi['부채유무'].fillna('미분류')
+
+    group_keys_multi = ['조사연도', '연령그룹', '수도권여부', '주택종류통합코드',
+                        '고령층유형', '부채유무']
+
+    grp4 = df_multi.groupby(group_keys_multi).agg(
+        표본수                  = (WT_COL,       'count'),
+        추정가구수_가중치합     = (WT_COL,       'sum'),
+        처분가능소득_평균       = (INC_COL,      'mean'),
+        처분가능소득_분산       = (INC_COL,      'var'),
+        거주주택금액_평균       = (RE_COL,       'mean'),
+        거주주택금액_분산       = (RE_COL,       'var'),
+        유동성_정체지수_평균    = ('유동성_정체지수_raw', 'mean'),
+        유동성_정체지수_분산    = ('유동성_정체지수_raw', 'var'),
+        경직적_비용비중_평균    = ('경직적_비용비중', 'mean'),
+    ).reset_index()
+    grp4 = clean_inf_nan(grp4)
+    # 분산 컬럼 결측(표본 1건일 때 발생) → 0으로 처리
+    var_cols = [c for c in grp4.columns if '분산' in c]
+    grp4[var_cols] = grp4[var_cols].fillna(0).round(2)
+    mean_cols = [c for c in grp4.columns if '평균' in c]
+    grp4[mean_cols] = grp4[mean_cols].round(2)
+    grp4 = apply_k_anonymity(grp4, '표본수', k=5)
+    save_xlsx(grp4, '04_다각도_그루핑_매트릭스.xlsx')
+    del df_multi
 
     print("  [완료] 가계금융복지조사 집계 3종")
     return grp1
